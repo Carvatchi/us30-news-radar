@@ -1,4 +1,4 @@
-import os, requests, pandas as pd, streamlit as st, plotly.express as px
+import requests, pandas as pd, streamlit as st, plotly.express as px
 from datetime import datetime, timedelta, timezone
 from math import exp
 
@@ -9,22 +9,16 @@ st.set_page_config(page_title="US30 / DIA News Radar", layout="wide")
 st.title("📈 US30 / DIA News Radar – Dashboard")
 
 # =========================
-#   API KEYS (hardcoded + UI)
+#   API KEYS (hardcoded + Secrets fallback)
 # =========================
-# NewsAPI (hardcoded – nu mai cere în UI)
-NEWSAPI_KEY = "a3b28961a34841c98c8f2b95643ee3c1"
+# NewsAPI – cheie hardcodată (schimb-o aici când vrei) + fallback la Secrets
+NEWSAPI_KEY = "a3b28961a34841c98c8f2b95643ee3c1" or st.secrets.get("NEWSAPI_KEY", "")
 
 with st.sidebar:
     st.header("🔐 Chei & Provider Calendar")
     cal_provider = st.radio("Provider calendar", ["TradingEconomics", "FinancialModelingPrep"], index=0)
-    # TradingEconomics – default guest:guest (demo)
-    TE_KEY = st.text_input("TradingEconomics Key", value="guest:guest", type="password")
-    # FMP – poți pune cheia ta sau 'demo'
-    FMP_KEY = st.text_input("FMP Key (opțional)", value="", type="password", placeholder="ex: demo sau cheia ta")
-
-if not NEWSAPI_KEY:
-    st.error("❌ Lipsă NewsAPI Key – verifică codul.")
-    st.stop()
+    TE_KEY = st.text_input("TradingEconomics Key", value=st.secrets.get("TE_KEY", "guest:guest"), type="password")
+    FMP_KEY = st.text_input("FMP Key (opțional)", value=st.secrets.get("FMP_KEY", ""), type="password", placeholder="ex: demo sau cheia ta")
 
 # =========================
 #   LEXICON + DOW + SCORING V2
@@ -142,7 +136,7 @@ def intensity(text: str) -> float:
     for strong in ["surge","plunge","soar","collapse","shock","crash","soaring","spiking"]:
         if strong in t: score += 0.3
     for mild in ["edges","slight","modest","muted"]:
-        if mild in t: score -= 0.1
+        score -= 0.1 if mild in t else 0.0
     return max(0.7, min(1.6, score))
 
 def recency_decay(pub_dt, now_dt, tau_hours=12.0) -> float:
@@ -155,9 +149,12 @@ def recency_decay(pub_dt, now_dt, tau_hours=12.0) -> float:
 def score_article_v2(article, now_dt):
     title = article.get("title") or ""
     desc  = article.get("description") or ""
-    source = (article.get("source") or {}).get("name","")
+    # source poate fi dict sau string
+    src = article.get("source")
+    source = (src.get("name","") if isinstance(src, dict) else (src or ""))
     cats = categorize_strict(title, desc)
-    if not cats: return None
+    if not cats:
+        return None
     text = f"{title} {desc}"
     sign = direction_sign(text)
     inten = intensity(text)
@@ -169,7 +166,7 @@ def score_article_v2(article, now_dt):
     HEAVY = {"GS","CAT","HD","SHW"}
     if contains_any(text, HEAVY):
         raw *= 1.15
-    return {"_score": round(raw, 4), "_cats": cats, "_source_w": w_src}
+    return {"_score": round(raw, 4), "_cats": cats, "_source_w": w_src, "_source_name": source}
 
 # =========================
 #   SIDEBAR – FILTRE & ALERTS
@@ -191,30 +188,41 @@ with st.sidebar:
 if only_hi_impact:
     cat_filter = [c for c in cat_filter if c in ["fed_policy","inflation_labor","crisis_recession","global_geopolitics"]]
 
-def build_query(only_dow: bool) -> str:
+def build_query(only_dow_flag: bool) -> str:
     base = '("United States" OR US OR USA OR "Federal Reserve" OR "Dow Jones")'
-    if only_dow:
+    if only_dow_flag:
         comps = " OR ".join(f'"{name}"' for name in DOW_COMPONENTS.values())
         return f"({base}) AND ({comps})"
     return base
 
-def fetch_news(fr_iso: str, to_iso: str, pages: int, sources: str|None):
+# =========================
+#   NEWS LOADER (robust, cu mesaje clare)
+# =========================
+def fetch_news(fr_iso: str, to_iso: str, pages_n: int, sources_csv: str|None):
+    if not NEWSAPI_KEY:
+        return pd.DataFrame()
     url = "https://newsapi.org/v2/everything"
     all_rows = []
     headers = {"Authorization": NEWSAPI_KEY}
-    for page in range(1, pages+1):
+    for page in range(1, pages_n+1):
         params = {
             "q": build_query(only_dow),
             "language": "en", "from": fr_iso, "to": to_iso,
             "pageSize": 100, "page": page, "sortBy":"publishedAt"
         }
-        if sources:
-            params["sources"] = sources
+        if sources_csv:
+            params["sources"] = sources_csv
         r = requests.get(url, headers=headers, params=params, timeout=20)
         if r.status_code != 200:
-            raise RuntimeError(f"NewsAPI error {r.status_code}: {r.text[:200]}")
+            try:
+                msg = r.json()
+            except Exception:
+                msg = r.text
+            st.warning(f"NewsAPI a răspuns cu {r.status_code}: {str(msg)[:200]}")
+            return pd.DataFrame()
         arts = r.json().get("articles", [])
-        if not arts: break
+        if not arts:
+            break
         for a in arts:
             all_rows.append({
                 "publishedAt": a.get("publishedAt"),
@@ -223,34 +231,43 @@ def fetch_news(fr_iso: str, to_iso: str, pages: int, sources: str|None):
                 "description": a.get("description"),
                 "url": a.get("url")
             })
-        if len(arts) < 100: break
+        if len(arts) < 100:
+            break
     df = pd.DataFrame(all_rows)
-    if df.empty: return df
+    if df.empty:
+        return df
     df["publishedAt"] = pd.to_datetime(df["publishedAt"], utc=True, errors="coerce")
     return df
 
 @st.cache_data(ttl=600, show_spinner=False)
-def load_news(days:int, pages:int, sources:str|None, active_cats:list):
+def load_news(days_back:int, pages_n:int, sources_csv:str|None, active_cats:list):
     now = datetime.now(timezone.utc)
-    fr = now - timedelta(days=days)
-    df = fetch_news(fr.isoformat(), now.isoformat(), pages, sources)
-    if df.empty: return df
+    fr = now - timedelta(days=days_back)
+    df = fetch_news(fr.isoformat(), now.isoformat(), pages_n, sources_csv)
+    if df.empty:
+        return df
     rows = []
     for _, a in df.iterrows():
-        art = {"publishedAt": a["publishedAt"], "source": {"name": a["source"]}, "title": a["title"], "description": a["description"], "url": a["url"]}
+        art = {
+            "publishedAt": a["publishedAt"], 
+            "source": {"name": a["source"]} if a["source"] else a["source"],
+            "title": a["title"], "description": a["description"], "url": a["url"]
+        }
         scored = score_article_v2(art, now)
-        if scored is None: 
-            continue
-        if not any(c in active_cats for c in scored["_cats"]):
+        if scored is None or not any(c in active_cats for c in scored["_cats"]):
             continue
         art.update(scored)
         rows.append(art)
-    if not rows: 
+    if not rows:
         return pd.DataFrame()
     out = pd.DataFrame(rows)
+    out["_source_name"] = out["_source_name"].fillna("").astype(str)
     out["bias"] = out["_score"].apply(lambda s: "Bullish" if s>0.1 else ("Bearish" if s<-0.1 else "Mixed"))
     return out
 
+# =========================
+#   CALENDAR LOADERS (TE + FMP) cu fallback
+# =========================
 def impact_arrow(delta):
     if delta is None: return "≈"
     if delta > 0.1:  return "⬆️"
@@ -263,9 +280,13 @@ def load_te_calendar(start_date: datetime, end_date: datetime, key: str):
     base = "https://api.tradingeconomics.com/calendar"
     d1, d2 = start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d")
     params = {"country":"united states", "d1": d1, "d2": d2, "importance":"2,3", "c": key}
-    r = requests.get(base, params=params, timeout=20)
-    if r.status_code != 200: return pd.DataFrame()
-    data = r.json() or []
+    try:
+        r = requests.get(base, params=params, timeout=20)
+        if r.status_code != 200:
+            return pd.DataFrame()
+        data = r.json() or []
+    except Exception:
+        return pd.DataFrame()
     rows = []
     for it in data:
         rows.append({
@@ -333,6 +354,14 @@ def load_fmp_calendar(start_date: datetime, end_date: datetime, api_key: str):
     df["imp_lbl"] = df["importance"].map(imp_map).fillna(df["importance"])
     return df.sort_values("datetime")
 
+def get_calendar_span(span_days:int, provider:str, te_key:str, fmp_key:str):
+    if provider == "TradingEconomics":
+        df_cal = load_te_calendar(datetime.now(timezone.utc), datetime.now(timezone.utc) + timedelta(days=span_days), te_key)
+        if df_cal is None or df_cal.empty:
+            df_cal = load_fmp_calendar(datetime.now(timezone.utc), datetime.now(timezone.utc) + timedelta(days=span_days), fmp_key or "demo")
+        return df_cal
+    return load_fmp_calendar(datetime.now(timezone.utc), datetime.now(timezone.utc) + timedelta(days=span_days), fmp_key or "demo")
+
 # =========================
 #   REFRESH CACHE
 # =========================
@@ -342,18 +371,18 @@ if refresh:
 # =========================
 #   LOAD NEWS
 # =========================
-sources = src_whitelist.strip().replace(" ", "") or None
-active_cats = cat_filter
+sources_csv = (src_whitelist or "").strip().replace(" ", "") or None
+
 try:
     with st.spinner("Încarc știrile…"):
-        news_df = load_news(days, pages, sources, active_cats)
+        news_df = load_news(days, pages, sources_csv, cat_filter)
 except Exception as e:
     st.error(f"Nu am putut încărca știrile: {e}")
-    st.stop()
+    news_df = pd.DataFrame()
 
 if news_df is None or news_df.empty:
-    st.warning("Nu am găsit știri relevante pe filtrul curent.")
-    news_df = pd.DataFrame(columns=["publishedAt","_score","bias","title","source","url","_cats"])
+    st.info("Nu am găsit știri relevante (posibil NewsAPI restricționat pe Cloud sau filtre prea stricte).")
+    news_df = pd.DataFrame(columns=["publishedAt","_score","bias","title","_source_name","url","_cats"])
 
 # =========================
 #   KPI FROM NEWS
@@ -367,18 +396,13 @@ c1.metric("Știri relevante", len(news_df))
 c2.metric("Bias", bias, delta=f"{mean_score:.2f}")
 c3.metric("Confidence", f"{confidence}/100")
 
-today = datetime.now(timezone.utc)
-start_day = today.replace(hour=0,minute=0,second=0,microsecond=0)
-end_day   = today.replace(hour=23,minute=59,second=59,microsecond=0)
-
-if cal_provider == "TradingEconomics":
-    cal_today = load_te_calendar(start_day, end_day, TE_KEY)
-else:
-    cal_today = load_fmp_calendar(start_day, end_day, FMP_KEY or "demo")
-
+# =========================
+#   CALENDAR INTELIGENT (US) + metric
+# =========================
+cal_today = get_calendar_span(1, cal_provider, TE_KEY, FMP_KEY)
 c4.metric("Evenimente Macro azi (US)", len(cal_today) if not cal_today.empty else 0)
 
-# Alerts
+# Alerts vizuale
 if mean_score <= bear_thr:
     st.error(f"⚠️ Alertă Bearish: bias={mean_score:.2f} ≤ {bear_thr:.2f}")
 elif mean_score >= bull_thr:
@@ -387,43 +411,63 @@ elif mean_score >= bull_thr:
 st.caption("Legendă scor știri: + = tentă bullish • − = tentă bearish • |valoare| mare = impact mai puternic.")
 
 # =========================
-#   CHARTS
+#   CHARTS (robuste, fără dict pe groupby)
 # =========================
 if not news_df.empty:
     tmp = news_df.copy()
-    tmp["date"] = pd.to_datetime(tmp["publishedAt"], utc=True).dt.tz_convert(None).dt.date
-    by_bias = tmp.groupby("bias").size().reset_index(name="count")
-    fig1 = px.bar(by_bias, x="bias", y="count", title="Distribuția bias-ului (Bullish / Bearish / Mixed)")
-    st.plotly_chart(fig1, use_container_width=True)
 
-    by_day = tmp.groupby("date")["_score"].mean().reset_index()
-    fig2 = px.line(by_day, x="date", y="_score", title="Scor mediu zilnic (știri)")
-    st.plotly_chart(fig2, use_container_width=True)
+    # 1) Dată pentru linii
+    if "publishedAt" in tmp.columns:
+        tmp["date"] = pd.to_datetime(tmp["publishedAt"], utc=True, errors="coerce").dt.tz_convert(None).dt.date
+    else:
+        tmp["date"] = pd.NaT
 
-    top_src = tmp.groupby("source").size().sort_values(ascending=False).head(12).reset_index(name="count")
-    fig3 = px.bar(top_src, x="source", y="count", title="Top surse (număr articole)")
-    st.plotly_chart(fig3, use_container_width=True)
+    # 2) Bias bar chart
+    if "bias" in tmp.columns:
+        by_bias = tmp.groupby("bias", dropna=False).size().reset_index(name="count")
+        if not by_bias.empty:
+            fig1 = px.bar(by_bias, x="bias", y="count", title="Distribuția bias-ului (Bullish / Bearish / Mixed)")
+            st.plotly_chart(fig1, use_container_width=True)
+
+    # 3) Scor mediu pe zi (linie)
+    if "_score" in tmp.columns:
+        by_day = tmp.groupby("date")["_score"].mean().reset_index()
+        if not by_day.empty:
+            fig2 = px.line(by_day, x="date", y="_score", title="Scor mediu zilnic (știri)")
+            st.plotly_chart(fig2, use_container_width=True)
+
+    # 4) Top surse — folosim ÎNTOTDEAUNA string
+    if "_source_name" not in tmp.columns:
+        if "source" in tmp.columns:
+            try:
+                tmp["_source_name"] = tmp["source"].apply(
+                    lambda s: (s.get("name","") if isinstance(s, dict) else (s or ""))
+                ).astype(str)
+            except Exception:
+                tmp["_source_name"] = tmp["source"].astype(str)
+        else:
+            tmp["_source_name"] = ""
+    top_src = tmp.groupby("_source_name", dropna=False).size().sort_values(ascending=False).head(12).reset_index(name="count")
+    top_src = top_src.rename(columns={"_source_name":"source"})
+    if not top_src.empty:
+        fig3 = px.bar(top_src, x="source", y="count", title="Top surse (număr articole)")
+        st.plotly_chart(fig3, use_container_width=True)
 
 # =========================
-#   CALENDAR INTELIGENT (US)
+#   CALENDAR SECTION (UI)
 # =========================
 st.subheader("🗓️ Calendar inteligent (US)")
 dleft, dright = st.columns([1,2])
 with dleft:
-    cal_days = st.selectbox("Interval calendar", ["Azi", "3 zile", "7 zile"], index=1)
-    span = {"Azi":1, "3 zile":3, "7 zile":7}[cal_days]
+    cal_days_label = st.selectbox("Interval calendar", ["Azi", "3 zile", "7 zile"], index=1)
+    span = {"Azi":1, "3 zile":3, "7 zile":7}[cal_days_label]
 with dright:
-    st.caption("Dacă TE Key este setată, folosim TradingEconomics; altfel poți alege FMP în sidebar. Săgeata ⬆️/⬇️/≈ sugerează impact direcțional estimat (euristic).")
+    st.caption("Încerc mai întâi TradingEconomics (cheie setată). Dacă nu răspunde, fac fallback la FMP (cheie sau 'demo'). Săgeata ⬆️/⬇️/≈ = impact direcțional estimat (euristic).")
 
-start = today
-end   = today + timedelta(days=span)
-if cal_provider == "TradingEconomics":
-    cal_df = load_te_calendar(start, end, TE_KEY)
-else:
-    cal_df = load_fmp_calendar(start, end, FMP_KEY or "demo")
+cal_df = get_calendar_span(span, cal_provider, TE_KEY, FMP_KEY)
 
 if cal_df is None or cal_df.empty:
-    st.info("Nu am date de calendar disponibile (cheie lipsă sau limitări API).")
+    st.info("Nu am date de calendar pentru intervalul ales (chei lipsă sau limitări API).")
 else:
     show = cal_df[["datetime","imp_lbl","event","actual","forecast","previous","arrow","category"]].copy()
     show = show.rename(columns={
@@ -438,8 +482,9 @@ else:
 # =========================
 st.subheader("📰 Știri filtrate")
 if not news_df.empty:
-    show_news = news_df.sort_values("publishedAt", ascending=False)[["publishedAt","source","title","_score","_cats","url","bias"]]
-    show_news = show_news.rename(columns={"_score":"score","_cats":"cats"})
+    show_news = news_df.sort_values("publishedAt", ascending=False)[
+        ["publishedAt","_source_name","title","_score","_cats","url","bias"]
+    ].rename(columns={"_source_name":"source","_score":"score","_cats":"cats"})
     st.dataframe(show_news, use_container_width=True, height=520)
     st.download_button("⬇️ Descarcă CSV filtrat", data=show_news.to_csv(index=False), file_name="us30_news_filtered.csv", mime="text/csv")
 else:
