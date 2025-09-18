@@ -1,6 +1,8 @@
 import requests, pandas as pd, streamlit as st, plotly.express as px
 from datetime import datetime, timedelta, timezone
 from math import exp
+import xml.etree.ElementTree as ET
+from io import BytesIO
 
 # =========================
 #   CONFIG & PAGE
@@ -12,9 +14,10 @@ st.title("📈 US30 / DIA News Radar – Dashboard")
 #   API KEYS (hardcoded + Secrets fallback)
 # =========================
 NEWSAPI_KEY = "a3b28961a34841c98c8f2b95643ee3c1" or st.secrets.get("NEWSAPI_KEY", "")
+
 with st.sidebar:
     st.header("🔐 Chei & Provider Calendar")
-    cal_provider = st.radio("Provider calendar", ["TradingEconomics", "FinancialModelingPrep"], index=0)
+    cal_provider = st.radio("Provider calendar preferat", ["TradingEconomics", "FinancialModelingPrep"], index=0)
     TE_KEY = st.text_input("TradingEconomics Key", value=st.secrets.get("TE_KEY", "guest:guest"), type="password")
     FMP_KEY = st.text_input("FMP Key (opțional)", value=st.secrets.get("FMP_KEY", ""), type="password", placeholder="ex: demo sau cheia ta")
 
@@ -170,7 +173,7 @@ def score_article_v2(article, now_dt):
 # =========================
 with st.sidebar:
     st.header("⚙️ Setări & Filtre")
-    period = st.selectbox("Perioadă", ["1 zi","3 zile","7 zile"], index=0)
+    period = st.selectbox("Perioadă (știri)", ["1 zi","3 zile","7 zile"], index=0)
     days = {"1 zi":1,"3 zile":3,"7 zile":7}[period]
     pages = st.slider("Pagini știri (x100/articole)", 1, 5, 3)
     only_hi_impact = st.checkbox("Doar Macro / Fed / Crize (impact mare)")
@@ -239,11 +242,7 @@ def fetch_news(fr_iso: str, to_iso: str, pages_n: int, sources_csv: str|None):
 @st.cache_data(ttl=600, show_spinner=False)
 def load_news(days_back:int, pages_n:int, sources_csv:str|None, active_cats:list):
     now = datetime.now(timezone.utc)
-    # IMPORTANT: pentru "1 zi" folosim ultimele 24h reale, nu 00:00 UTC
-    if days_back == 1:
-        fr = now - timedelta(hours=24)
-    else:
-        fr = now - timedelta(days=days_back)
+    fr = (now - timedelta(hours=24)) if days_back == 1 else (now - timedelta(days=days_back))
     df = fetch_news(fr.isoformat(), now.isoformat(), pages_n, sources_csv)
     if df.empty:
         return df
@@ -267,7 +266,7 @@ def load_news(days_back:int, pages_n:int, sources_csv:str|None, active_cats:list
     return out
 
 # =========================
-#   CALENDAR LOADERS (TE + FMP) cu fallback și fereastră extinsă
+#   CALENDAR LOADERS (TE + FMP + ForexFactory) cu fallback
 # =========================
 def impact_arrow(delta):
     if delta is None: return "≈"
@@ -275,26 +274,16 @@ def impact_arrow(delta):
     if delta < -0.1: return "⬇️"
     return "≈"
 
-def _te_request(params: dict):
-    base = "https://api.tradingeconomics.com/calendar"
-    try:
-        r = requests.get(base, params=params, timeout=20)
-        if r.status_code != 200:
-            return []
-        return r.json() or []
-    except Exception:
-        return []
-
 def _normalize_calendar_rows(data):
     rows = []
     for it in data:
         rows.append({
-            "datetime": it.get("Date") or it.get("date"),
-            "event": it.get("Event") or it.get("event"),
+            "datetime": it.get("Date") or it.get("date") or it.get("timestamp") or it.get("datetime"),
+            "event": it.get("Event") or it.get("event") or it.get("title"),
             "actual": it.get("Actual") or it.get("actual"),
             "forecast": it.get("Forecast") or it.get("forecast") or it.get("previous"),
             "previous": it.get("Previous") or it.get("previous"),
-            "importance": it.get("Importance") or it.get("impact") or "",
+            "importance": it.get("Importance") or it.get("impact") or it.get("impact_text") or "",
             "country": it.get("Country") or it.get("country"),
             "category": it.get("Category") or it.get("category") or "",
         })
@@ -310,24 +299,27 @@ def _normalize_calendar_rows(data):
     df["forecast_n"] = df["forecast"].apply(to_num)
     df["delta"] = df.apply(lambda r: None if r["actual_n"] is None or r["forecast_n"] is None else (r["actual_n"] - r["forecast_n"]), axis=1)
     df["arrow"] = df["delta"].apply(impact_arrow)
-    imp_map = {"High":"🔴 High","Medium":"🟠 Medium","Low":"🟡 Low", "": ""}
+    imp_map = {"High":"🔴 High","Medium":"🟠 Medium","Low":"🟡 Low", "High Impact":"🔴 High", "Medium Impact":"🟠 Medium", "Low Impact":"🟡 Low", "": ""}
     df["imp_lbl"] = df["importance"].map(imp_map).fillna(df["importance"])
     return df.sort_values("datetime")
 
 @st.cache_data(ttl=900, show_spinner=False)
 def load_te_calendar_span(start_dt: datetime, end_dt: datetime, key: str):
     if not key: return pd.DataFrame()
+    base = "https://api.tradingeconomics.com/calendar"
     d1, d2 = start_dt.strftime("%Y-%m-%d"), end_dt.strftime("%Y-%m-%d")
-    # 1) strict US + toate importanțele
-    data = _te_request({"country":"united states", "d1": d1, "d2": d2, "importance":"1,2,3", "c": key})
-    if not data:
-        # 2) fără country (global), apoi filtrăm local pe US
-        data = _te_request({"d1": d1, "d2": d2, "importance":"1,2,3", "c": key})
-    df = _normalize_calendar_rows(data)
-    if df.empty: return df
-    # filtrăm doar US
-    df = df[df["country"].astype(str).str.lower().str.contains("united", na=False)]
-    return df
+    try:
+        r = requests.get(base, params={"country":"united states","d1":d1,"d2":d2,"importance":"1,2,3","c":key}, timeout=20)
+        data = r.json() if r.status_code==200 else []
+        if not data:
+            r2 = requests.get(base, params={"d1":d1,"d2":d2,"importance":"1,2,3","c":key}, timeout=20)
+            data = r2.json() if r2.status_code==200 else []
+        df = _normalize_calendar_rows(data)
+        if df.empty: return df
+        # filtrează doar US
+        return df[df["country"].astype(str).str.lower().str.contains("united", na=False)]
+    except Exception:
+        return pd.DataFrame()
 
 @st.cache_data(ttl=900, show_spinner=False)
 def load_fmp_calendar_span(start_dt: datetime, end_dt: datetime, api_key: str):
@@ -336,24 +328,132 @@ def load_fmp_calendar_span(start_dt: datetime, end_dt: datetime, api_key: str):
     d1, d2 = start_dt.strftime("%Y-%m-%d"), end_dt.strftime("%Y-%m-%d")
     try:
         r = requests.get(base, params={"from": d1, "to": d2, "apikey": api_key}, timeout=20)
-        if r.status_code != 200: return pd.DataFrame()
-        data = r.json() or []
+        data = r.json() if r.status_code==200 else []
+        df = _normalize_calendar_rows(data)
+        return df
     except Exception:
         return pd.DataFrame()
-    df = _normalize_calendar_rows(data)
-    return df
+
+# --- ForexFactory public XML (this week + next week) ---
+def _ff_fetch_xml(url: str):
+    try:
+        r = requests.get(url, timeout=20)
+        if r.status_code != 200:
+            return None
+        return r.content
+    except Exception:
+        return None
+
+def _ff_parse(content: bytes):
+    # Schema cunoscută: <event> fields (title, country, impact, date, time, timestamp, actual, forecast, previous)
+    rows = []
+    try:
+        root = ET.parse(BytesIO(content)).getroot()
+        for ev in root.findall(".//event"):
+            def get(tag): 
+                el = ev.find(tag)
+                return el.text if el is not None else None
+            rows.append({
+                "timestamp": get("timestamp"),
+                "datetime": get("date") + " " + (get("time") or "00:00") if get("date") else get("timestamp"),
+                "event": get("title"),
+                "country": get("country"),
+                "importance": get("impact"),
+                "actual": get("actual"),
+                "forecast": get("forecast"),
+                "previous": get("previous"),
+                "category": get("folder")  # poate fi None
+            })
+    except Exception:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows)
+    if df.empty: return df
+    # Timestamps sunt în secunde epoch (UTC)
+    def _to_dt(row):
+        if row.get("timestamp"):
+            try:
+                return datetime.fromtimestamp(int(row["timestamp"]), tz=timezone.utc)
+            except Exception:
+                pass
+        # fallback din text "YYYY-MM-DD HH:MM" (fără tz -> asumăm UTC)
+        try:
+            return pd.to_datetime(row.get("datetime"), errors="coerce", utc=True)
+        except Exception:
+            return pd.NaT
+    df["datetime"] = df.apply(_to_dt, axis=1)
+    # Impact labels
+    impact_map = {
+        "High Impact Expected":"🔴 High",
+        "Medium Impact Expected":"🟠 Medium",
+        "Low Impact Expected":"🟡 Low",
+        "Non-Economic":""
+    }
+    df["imp_lbl"] = df["importance"].map(impact_map).fillna(df["importance"].fillna(""))
+    # Normalize numeric
+    def to_num(x):
+        try:
+            if x is None: return None
+            return float(str(x).replace("%","").replace(",","").strip())
+        except: return None
+    df["actual_n"] = df["actual"].apply(to_num)
+    df["forecast_n"] = df["forecast"].apply(to_num)
+    df["delta"] = df.apply(lambda r: None if r["actual_n"] is None or r["forecast_n"] is None else (r["actual_n"] - r["forecast_n"]), axis=1)
+    df["arrow"] = df["delta"].apply(impact_arrow)
+    return df.sort_values("datetime")
+
+@st.cache_data(ttl=900, show_spinner=False)
+def load_ff_calendar_span(start_dt: datetime, end_dt: datetime):
+    # Public feeds săptămânale
+    thisweek_url = "https://nfs.faireconomy.media/ff_calendar_thisweek.xml"
+    nextweek_url = "https://nfs.faireconomy.media/ff_calendar_nextweek.xml"
+    c1 = _ff_fetch_xml(thisweek_url)
+    c2 = _ff_fetch_xml(nextweek_url)
+    df1 = _ff_parse(c1) if c1 else pd.DataFrame()
+    df2 = _ff_parse(c2) if c2 else pd.DataFrame()
+    df = pd.concat([df1, df2], ignore_index=True) if not df1.empty or not df2.empty else pd.DataFrame()
+    if df.empty: return df
+    # doar USD (Statele Unite)
+    df_usd = df[df["country"]=="USD"].copy()
+    # fereastră
+    df_usd = df_usd[(df_usd["datetime"]>=start_dt) & (df_usd["datetime"]<=end_dt)]
+    # pregătim coloane ca în normalizer
+    df_usd = df_usd.rename(columns={"event":"Event","importance":"Importance","country":"Country","category":"Category"})
+    df_usd["event"] = df_usd["Event"]
+    df_usd["importance"] = df_usd["Importance"]
+    df_usd["country"] = "United States"
+    # deja are: datetime, actual, forecast, previous, imp_lbl, arrow
+    return df_usd.sort_values("datetime")
 
 def get_calendar_span(span_days:int, provider:str, te_key:str, fmp_key:str):
-    # Fereastră extinsă: acum - 8h până la acum + span_zile
     now = datetime.now(timezone.utc)
-    start_dt = now - timedelta(hours=8)
+    start_dt = now - timedelta(hours=8)      # extins spre trecut
     end_dt   = now + timedelta(days=span_days)
+    # 1) Providerul selectat
     if provider == "TradingEconomics":
-        df_cal = load_te_calendar_span(start_dt, end_dt, te_key)
-        if df_cal is None or df_cal.empty:
-            df_cal = load_fmp_calendar_span(start_dt, end_dt, fmp_key or "demo")
-        return df_cal
-    return load_fmp_calendar_span(start_dt, end_dt, fmp_key or "demo")
+        df = load_te_calendar_span(start_dt, end_dt, te_key)
+        if df is not None and not df.empty:
+            return df
+        # 2) Dacă TE e gol → încearcă FMP
+        df = load_fmp_calendar_span(start_dt, end_dt, fmp_key or "demo")
+        if df is not None and not df.empty:
+            # filtrăm doar US dacă e cazul
+            if "country" in df.columns:
+                df = df[df["country"].astype(str).str.contains("United", case=False, na=False)]
+            return df
+        # 3) Fallback: ForexFactory public XML
+        return load_ff_calendar_span(start_dt, end_dt)
+    else:
+        df = load_fmp_calendar_span(start_dt, end_dt, fmp_key or "demo")
+        if df is not None and not df.empty:
+            if "country" in df.columns:
+                df = df[df["country"].astype(str).str.contains("United", case=False, na=False)]
+            return df
+        # Fallback TE
+        df = load_te_calendar_span(start_dt, end_dt, te_key)
+        if df is not None and not df.empty:
+            return df
+        # Fallback FF public
+        return load_ff_calendar_span(start_dt, end_dt)
 
 # =========================
 #   REFRESH CACHE
@@ -392,7 +492,7 @@ c3.metric("Confidence", f"{confidence}/100")
 #   CALENDAR INTELIGENT (US) + metric
 # =========================
 cal_today = get_calendar_span(1, cal_provider, TE_KEY, FMP_KEY)
-c4.metric("Evenimente Macro azi (US)", len(cal_today) if not cal_today.empty else 0)
+c4.metric("Evenimente Macro azi (US)", len(cal_today) if cal_today is not None and not cal_today.empty else 0)
 
 # Alerts vizuale
 if mean_score <= bear_thr:
@@ -403,7 +503,7 @@ elif mean_score >= bull_thr:
 st.caption("Legendă scor știri: + = tentă bullish • − = tentă bearish • |valoare| mare = impact mai puternic.")
 
 # =========================
-#   CHARTS (robuste, fără dict pe groupby)
+#   CHARTS (robuste)
 # =========================
 if not news_df.empty:
     tmp = news_df.copy()
@@ -449,12 +549,12 @@ with dleft:
     cal_days_label = st.selectbox("Interval calendar", ["Azi", "3 zile", "7 zile"], index=1)
     span = {"Azi":1, "3 zile":3, "7 zile":7}[cal_days_label]
 with dright:
-    st.caption("Încerc TE (US, importance 1–3). Dacă TE nu răspunde/nu are date, încerc TE global și filtrez US, apoi fallback FMP. Săgeata ⬆️/⬇️/≈ = impact direcțional estimat (euristic).")
+    st.caption("Încerc providerul selectat (TE/FMP). Dacă nu are date, fac fallback automat la ForexFactory (public XML). Săgeata ⬆️/⬇️/≈ = impact direcțional estimat (euristic).")
 
 cal_df = get_calendar_span(span, cal_provider, TE_KEY, FMP_KEY)
 
 if cal_df is None or cal_df.empty:
-    st.info("Nu am date de calendar pentru intervalul ales (chei lipsă sau limitări API).")
+    st.info("Nu am date de calendar pentru intervalul ales (toți providerii au răspuns gol sau blocați).")
 else:
     show = cal_df[["datetime","imp_lbl","event","actual","forecast","previous","arrow","category"]].copy()
     show = show.rename(columns={
