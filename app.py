@@ -4,26 +4,26 @@ from math import exp
 import xml.etree.ElementTree as ET
 from io import BytesIO
 
-# =========================
-#   CONFIG & PAGE
-# =========================
+# ======================================
+#   PAGE CONFIG
+# ======================================
 st.set_page_config(page_title="US30 / DIA News Radar", layout="wide")
 st.title("📈 US30 / DIA News Radar – Dashboard")
 
-# =========================
-#   API KEYS (hardcoded + Secrets fallback)
-# =========================
+# ======================================
+#   API KEYS (hardcoded + Secrets)
+# ======================================
 NEWSAPI_KEY = "a3b28961a34841c98c8f2b95643ee3c1" or st.secrets.get("NEWSAPI_KEY", "")
 
 with st.sidebar:
     st.header("🔐 Chei & Provider Calendar")
     cal_provider = st.radio("Provider calendar preferat", ["TradingEconomics", "FinancialModelingPrep"], index=0)
-    TE_KEY = st.text_input("TradingEconomics Key", value=st.secrets.get("TE_KEY", "guest:guest"), type="password")
-    FMP_KEY = st.text_input("FMP Key (opțional)", value=st.secrets.get("FMP_KEY", ""), type="password", placeholder="ex: demo sau cheia ta")
+    TE_KEY = st.text_input("TradingEconomics Key", value=(st.secrets.get("TE_KEY") or "guest:guest"), type="password")
+    FMP_KEY = st.text_input("FMP Key (sau 'demo')", value=(st.secrets.get("FMP_KEY") or "demo"), type="password")
 
-# =========================
+# ======================================
 #   LEXICON + DOW + SCORING
-# =========================
+# ======================================
 KEYWORDS = {
     "fed_policy": ["FOMC","rate decision","rate hike","rate cut","policy meeting","press conference","dot plot","SEP","Powell","FOMC minutes","blackout period","balance sheet","quantitative tightening","QT","QE","IOER","reverse repo","RRP","financial conditions","Fed funds futures"],
     "inflation_labor": ["CPI","Core CPI","PCE","Core PCE","supercore","inflation expectations","disinflation","sticky inflation","Nonfarm payrolls","NFP","unemployment rate","average hourly earnings","AHE","jobless claims","JOLTS","ECI"],
@@ -75,10 +75,10 @@ def direction_sign(text: str) -> int:
 def intensity(text: str) -> float:
     t = (text or "").lower()
     score = 1.0
-    for strong in ["surge","plunge","soar","collapse","shock","crash","soaring","spiking"]:
-        if strong in t: score += 0.3
-    for mild in ["edges","slight","modest","muted"]:
-        if mild in t: score -= 0.1
+    for s in ["surge","plunge","soar","collapse","shock","crash","soaring","spiking"]:
+        if s in t: score += 0.3
+    for s in ["edges","slight","modest","muted"]:
+        if s in t: score -= 0.1
     return max(0.7, min(1.6, score))
 
 def recency_decay(pub_dt, now_dt, tau_hours=12.0) -> float:
@@ -108,9 +108,9 @@ def score_article_v2(article, now_dt):
         raw *= 1.15
     return {"_score": round(raw, 4), "_cats": cats, "_source_w": w_src, "_source_name": source}
 
-# =========================
+# ======================================
 #   SIDEBAR – FILTRE & ALERTS
-# =========================
+# ======================================
 with st.sidebar:
     st.header("⚙️ Setări & Filtre")
     period = st.selectbox("Perioadă (știri)", ["1 zi","3 zile","7 zile"], index=0)
@@ -128,24 +128,24 @@ with st.sidebar:
 if only_hi_impact:
     cat_filter = [c for c in cat_filter if c in ["fed_policy","inflation_labor","crisis_recession","global_geopolitics"]]
 
-# =========================
-#   NEWS: query batching (fix 500 chars), 24h pentru „1 zi”
-# =========================
+# ======================================
+#   NEWS: batching sub 500 chars + 24h pentru „1 zi”
+# ======================================
 def build_queries(only_dow_flag: bool) -> list[str]:
     base = '("United States" OR US OR USA OR "Federal Reserve" OR "Dow Jones")'
     if not only_dow_flag:
         return [base]
     names = list(DOW_COMPONENTS.values())
     batches, cur = [], []
-    def q_of(lst): return f'({base}) AND (' + " OR ".join(f'"{n}"' for n in lst) + ')'
+    def q(lst): return f'({base}) AND (' + " OR ".join(f'"{n}"' for n in lst) + ')'
     for n in names:
-        trial = q_of(cur + [n])
+        trial = q(cur + [n])
         if len(trial) > 480:
-            if cur: batches.append(q_of(cur)); cur = [n]
-            else:   batches.append(q_of([n])); cur = []
+            if cur: batches.append(q(cur)); cur = [n]
+            else:   batches.append(q([n]));  cur = []
         else:
             cur.append(n)
-    if cur: batches.append(q_of(cur))
+    if cur: batches.append(q(cur))
     return batches or [base]
 
 def fetch_news(fr_dt: datetime, to_dt: datetime|None, pages_total: int, sources_csv: str|None, only_dow_flag: bool):
@@ -155,6 +155,7 @@ def fetch_news(fr_dt: datetime, to_dt: datetime|None, pages_total: int, sources_
     queries = build_queries(only_dow_flag)
     per_query = [pages_total // len(queries)] * len(queries)
     for i in range(pages_total % len(queries)): per_query[i] += 1
+
     all_rows, seen = [], set()
     for qi, q in enumerate(queries):
         for page in range(1, per_query[qi] + 1):
@@ -165,7 +166,7 @@ def fetch_news(fr_dt: datetime, to_dt: datetime|None, pages_total: int, sources_
             if r.status_code != 200:
                 try: msg = r.json()
                 except Exception: msg = r.text
-                st.warning(f"NewsAPI {r.status_code} pentru batch {qi+1}/{len(queries)}: {str(msg)[:200]}")
+                st.warning(f"NewsAPI {r.status_code} batch {qi+1}/{len(queries)}: {str(msg)[:200]}")
                 break
             arts = r.json().get("articles", [])
             if not arts: break
@@ -198,9 +199,9 @@ def load_news(days_back:int, pages_total:int, sources_csv:str|None, active_cats:
     out["bias"] = out["_score"].apply(lambda s: "Bullish" if s>0.1 else ("Bearish" if s<-0.1 else "Mixed"))
     return out
 
-# =========================
-#   CALENDAR LOADERS (TE + FMP + ForexFactory) + DIAGNOSTIC
-# =========================
+# ======================================
+#   CALENDAR – chunking + multi-fallback
+# ======================================
 def impact_arrow(delta):
     if delta is None: return "≈"
     if delta > 0.1:  return "⬆️"
@@ -234,41 +235,57 @@ def _normalize_calendar_rows(data):
     df["arrow"] = df["delta"].apply(impact_arrow)
     imp_map = {"High":"🔴 High","Medium":"🟠 Medium","Low":"🟡 Low","High Impact":"🔴 High","Medium Impact":"🟠 Medium","Low Impact":"🟡 Low","": ""}
     df["imp_lbl"] = df["importance"].map(imp_map).fillna(df["importance"])
-    # garantează coloanele standard
     for col in ["datetime","imp_lbl","event","actual","forecast","previous","arrow","category","country"]:
         if col not in df.columns: df[col] = ""
     return df.sort_values("datetime")
 
-def _te_get(d1, d2, key, params_extra=None):
+def _te_fetch(d1, d2, key, extra=None):
     base = "https://api.tradingeconomics.com/calendar"
-    p = {"d1": d1, "d2": d2, "importance":"1,2,3", "c": key}
-    if params_extra: p.update(params_extra)
+    p = {"d1": d1, "d2": d2, "importance": "1,2,3", "c": key}
+    if extra: p.update(extra)
     try:
         r = requests.get(base, params=p, timeout=20)
-        if r.status_code != 200: 
+        if r.status_code != 200:
             return [], f"TE HTTP {r.status_code}: {r.text[:120]}"
         return (r.json() or []), ""
     except Exception as e:
         return [], f"TE exc: {e}"
 
-def _fmp_get(d1, d2, key):
+def _fmp_fetch(d1, d2, key):
     base = "https://financialmodelingprep.com/api/v3/economic_calendar"
     try:
-        r = requests.get(base, params={"from": d1, "to": d2, "apikey": key}, timeout=20)
+        r = requests.get(base, params={"from": d1, "to": d2, "apikey": (key or "demo")}, timeout=20)
         if r.status_code != 200:
             return [], f"FMP HTTP {r.status_code}: {r.text[:120]}"
         return (r.json() or []), ""
     except Exception as e:
         return [], f"FMP exc: {e}"
 
-def _ff_fetch_xml(url: str):
-    try:
-        r = requests.get(url, timeout=20)
-        if r.status_code != 200:
-            return None, f"FF HTTP {r.status_code}"
-        return r.content, ""
-    except Exception as e:
-        return None, f"FF exc: {e}"
+def _date_chunks(start_dt: datetime, end_dt: datetime, step_days=3):
+    cur = start_dt
+    while cur < end_dt:
+        nxt = min(cur + timedelta(days=step_days), end_dt)
+        yield cur.strftime("%Y-%m-%d"), nxt.strftime("%Y-%m-%d")
+        cur = nxt
+
+_FF_BASES = [
+    "https://nfs.faireconomy.media",
+    "https://cdn-nfs.faireconomy.media",
+    "http://nfs.faireconomy.media",
+    "http://cdn-nfs.faireconomy.media",
+]
+def _ff_try_fetch(path: str):
+    last_err = ""
+    for base in _FF_BASES:
+        url = f"{base}{path}"
+        try:
+            r = requests.get(url, timeout=20)
+            if r.status_code == 200:
+                return r.content, ""
+            last_err = f"FF HTTP {r.status_code} @ {base}"
+        except Exception as e:
+            last_err = f"FF exc @ {base}: {e}"
+    return None, last_err
 
 def _ff_parse(content: bytes):
     rows = []
@@ -295,14 +312,9 @@ def _ff_parse(content: bytes):
     if df.empty: return df
     def _to_dt(row):
         if row.get("timestamp"):
-            try:
-                return datetime.fromtimestamp(int(row["timestamp"]), tz=timezone.utc)
-            except Exception:
-                pass
-        try:
-            return pd.to_datetime(row.get("datetime"), errors="coerce", utc=True)
-        except Exception:
-            return pd.NaT
+            try: return datetime.fromtimestamp(int(row["timestamp"]), tz=timezone.utc)
+            except Exception: pass
+        return pd.to_datetime(row.get("datetime"), errors="coerce", utc=True)
     df["datetime"] = df.apply(_to_dt, axis=1)
     impact_map = {"High Impact Expected":"🔴 High","Medium Impact Expected":"🟠 Medium","Low Impact Expected":"🟡 Low","Non-Economic":""}
     df["imp_lbl"] = df["importance"].map(impact_map).fillna(df["importance"].fillna(""))
@@ -314,8 +326,7 @@ def _ff_parse(content: bytes):
     df["actual_n"] = df["actual"].apply(to_num)
     df["forecast_n"] = df["forecast"].apply(to_num)
     df["delta"] = df.apply(lambda r: None if r["actual_n"] is None or r["forecast_n"] is None else (r["actual_n"] - r["forecast_n"]), axis=1)
-    df["arrow"] = df["delta"].apply(lambda d: "⬆️" if (d is not None and d>0.1) else ("⬇️" if (d is not None and d<-0.1) else "≈"))
-    # garantează coloanele standard
+    df["arrow"] = df["delta"].apply(impact_arrow)
     for col in ["datetime","imp_lbl","event","actual","forecast","previous","arrow","category","country"]:
         if col not in df.columns: df[col] = ""
     return df.sort_values("datetime")
@@ -325,73 +336,96 @@ def load_calendar_with_diagnostics(span_days:int, provider:str, te_key:str, fmp_
     now = datetime.now(timezone.utc)
     start_dt = now - timedelta(hours=8)
     end_dt   = now + timedelta(days=span_days)
-    d1, d2 = start_dt.strftime("%Y-%m-%d"), end_dt.strftime("%Y-%m-%d")
-
     diag = {"TE_msg":"", "FMP_msg":"", "FF_msg":""}
 
+    # 1) Provider preferat, CHUNKING 3 zile
+    all_rows = []
     if provider == "TradingEconomics":
-        data, msg = _te_get(d1, d2, te_key, {"country":"united states"})
-        if not data:
-            data, msg2 = _te_get(d1, d2, te_key, None)
-            msg = msg or msg2
-        diag["TE_msg"] = msg
-        df = _normalize_calendar_rows(data)
+        te_msgs = []
+        for d1, d2 in _date_chunks(start_dt, end_dt, step_days=3):
+            data, msg = _te_fetch(d1, d2, te_key, {"country":"united states"})
+            if not data:
+                data, msg2 = _te_fetch(d1, d2, te_key, None)
+                msg = msg or msg2
+            te_msgs.append(msg)
+            if data: all_rows.extend(data)
+        diag["TE_msg"] = "; ".join([m for m in te_msgs if m])[:200]
+        df = _normalize_calendar_rows(all_rows)
         if not df.empty:
             df = df[df["country"].astype(str).str.contains("United", case=False, na=False)]
-            return df, diag
-        data, msg = _fmp_get(d1, d2, fmp_key or "demo")
-        diag["FMP_msg"] = msg
-        df = _normalize_calendar_rows(data)
-        if not df.empty:
-            if "country" in df.columns:
-                df = df[df["country"].astype(str).str.contains("United", case=False, na=False)]
-            return df, diag
-    else:
-        data, msg = _fmp_get(d1, d2, fmp_key or "demo")
-        diag["FMP_msg"] = msg
-        df = _normalize_calendar_rows(data)
-        if not df.empty:
-            if "country" in df.columns:
-                df = df[df["country"].astype(str).str.contains("United", case=False, na=False)]
-            return df, diag
-        data, msg = _te_get(d1, d2, te_key, {"country":"united states"})
-        if not data:
-            data, msg2 = _te_get(d1, d2, te_key, None)
-            msg = msg or msg2
-        diag["TE_msg"] = msg
-        df = _normalize_calendar_rows(data)
-        if not df.empty:
-            df = df[df["country"].astype(str).str.contains("United", case=False, na=False)]
+            df = df[(df["datetime"]>=start_dt) & (df["datetime"]<=end_dt)]
             return df, diag
 
-    # ForexFactory public
-    thisweek_url = "https://nfs.faireconomy.media/ff_calendar_thisweek.xml"
-    nextweek_url = "https://nfs.faireconomy.media/ff_calendar_nextweek.xml"
-    c1, m1 = _ff_fetch_xml(thisweek_url)
-    c2, m2 = _ff_fetch_xml(nextweek_url)
-    diag["FF_msg"] = m1 or m2
+        # FMP fallback (chunking)
+        fmp_msgs, all_rows = [], []
+        for d1, d2 in _date_chunks(start_dt, end_dt, step_days=3):
+            data, msg = _fmp_fetch(d1, d2, fmp_key or "demo")
+            fmp_msgs.append(msg)
+            if data: all_rows.extend(data)
+        diag["FMP_msg"] = "; ".join([m for m in fmp_msgs if m])[:200]
+        df = _normalize_calendar_rows(all_rows)
+        if not df.empty:
+            if "country" in df.columns:
+                df = df[df["country"].astype(str).str.contains("United", case=False, na=False)]
+            df = df[(df["datetime"]>=start_dt) & (df["datetime"]<=end_dt)]
+            return df, diag
+
+    else:
+        # FMP preferat
+        fmp_msgs, all_rows = [], []
+        for d1, d2 in _date_chunks(start_dt, end_dt, step_days=3):
+            data, msg = _fmp_fetch(d1, d2, fmp_key or "demo")
+            fmp_msgs.append(msg)
+            if data: all_rows.extend(data)
+        diag["FMP_msg"] = "; ".join([m for m in fmp_msgs if m])[:200]
+        df = _normalize_calendar_rows(all_rows)
+        if not df.empty:
+            if "country" in df.columns:
+                df = df[df["country"].astype(str).str.contains("United", case=False, na=False)]
+            df = df[(df["datetime"]>=start_dt) & (df["datetime"]<=end_dt)]
+            return df, diag
+
+        # TE fallback
+        te_msgs, all_rows = [], []
+        for d1, d2 in _date_chunks(start_dt, end_dt, step_days=3):
+            data, msg = _te_fetch(d1, d2, te_key, {"country":"united states"})
+            if not data:
+                data, msg2 = _te_fetch(d1, d2, te_key, None)
+                msg = msg or msg2
+            te_msgs.append(msg)
+            if data: all_rows.extend(data)
+        diag["TE_msg"] = "; ".join([m for m in te_msgs if m])[:200]
+        df = _normalize_calendar_rows(all_rows)
+        if not df.empty:
+            df = df[df["country"].astype(str).str.contains("United", case=False, na=False)]
+            df = df[(df["datetime"]>=start_dt) & (df["datetime"]<=end_dt)]
+            return df, diag
+
+    # 2) ForexFactory (două săptămâni), multi-host retry
+    c1, m1 = _ff_try_fetch("/ff_calendar_thisweek.xml")
+    c2, m2 = _ff_try_fetch("/ff_calendar_nextweek.xml")
+    diag["FF_msg"] = (m1 or m2)[:200]
     df1 = _ff_parse(c1) if c1 else pd.DataFrame()
     df2 = _ff_parse(c2) if c2 else pd.DataFrame()
     df = pd.concat([df1, df2], ignore_index=True) if not df1.empty or not df2.empty else pd.DataFrame()
     if not df.empty:
-        df = df[(df["country"]=="United States") | (df["country"]=="USD")]
+        df = df[(df["country"].astype(str).str.upper().isin(["USD","UNITED STATES"]))]
         df = df[(df["datetime"]>=start_dt) & (df["datetime"]<=end_dt)]
-    # asigură coloane standard
     if df is None or df.empty:
         df = pd.DataFrame(columns=["datetime","imp_lbl","event","actual","forecast","previous","arrow","category","country"])
     for col in ["datetime","imp_lbl","event","actual","forecast","previous","arrow","category","country"]:
         if col not in df.columns: df[col] = ""
     return df.sort_values("datetime"), diag
 
-# =========================
+# ======================================
 #   REFRESH CACHE
-# =========================
+# ======================================
 if refresh:
     st.cache_data.clear()
 
-# =========================
+# ======================================
 #   LOAD NEWS
-# =========================
+# ======================================
 sources_csv = (src_whitelist or "").strip().replace(" ", "") or None
 try:
     with st.spinner("Încarc știrile…"):
@@ -404,9 +438,9 @@ if news_df is None or news_df.empty:
     st.info("Nu am găsit știri relevante (posibil NewsAPI restricționat pe Cloud sau filtre prea stricte).")
     news_df = pd.DataFrame(columns=["publishedAt","_score","bias","title","_source_name","url","_cats"])
 
-# =========================
-#   KPI FROM NEWS
-# =========================
+# ======================================
+#   KPIs
+# ======================================
 mean_score = news_df["_score"].mean() if not news_df.empty else 0.0
 bias = "Bullish" if mean_score>0.1 else ("Bearish" if mean_score<-0.1 else "Mixed")
 confidence = int(min(100, abs(mean_score)*35 + min(60, (len(news_df)/5) if not news_df.empty else 0)))
@@ -416,26 +450,17 @@ c1.metric("Știri relevante", len(news_df))
 c2.metric("Bias", bias, delta=f"{mean_score:.2f}")
 c3.metric("Confidence", f"{confidence}/100")
 
-# =========================
-#   CALENDAR INTELIGENT (US) + METRIC + DIAGNOSTIC
-# =========================
-cal_df, diag = load_calendar_with_diagnostics(1, cal_provider, TE_KEY, FMP_KEY)
-c4.metric("Evenimente Macro azi (US)", len(cal_df) if cal_df is not None and not cal_df.empty else 0)
-
+# ======================================
+#   CALENDAR INTELIGENT (azi) + DIAGNOSTIC
+# ======================================
+cal_df_today, diag_today = load_calendar_with_diagnostics(1, cal_provider, TE_KEY, FMP_KEY)
+c4.metric("Evenimente Macro azi (US)", len(cal_df_today) if cal_df_today is not None and not cal_df_today.empty else 0)
 with st.expander("🧪 Diagnostic calendar (TE/FMP/FF)"):
-    st.code(diag, language="json")
+    st.code(diag_today, language="json")
 
-# Alerts vizuale
-if mean_score <= bear_thr:
-    st.error(f"⚠️ Alertă Bearish: bias={mean_score:.2f} ≤ {bear_thr:.2f}")
-elif mean_score >= bull_thr:
-    st.success(f"✅ Alertă Bullish: bias={mean_score:.2f} ≥ {bull_thr:.2f}")
-
-st.caption("Legendă scor știri: + = tentă bullish • − = tentă bearish • |valoare| mare = impact mai puternic.")
-
-# =========================
-#   CHARTS
-# =========================
+# ======================================
+#   CHARTS (știri)
+# ======================================
 if not news_df.empty:
     tmp = news_df.copy()
     if "publishedAt" in tmp.columns:
@@ -445,7 +470,7 @@ if not news_df.empty:
     if "bias" in tmp.columns:
         by_bias = tmp.groupby("bias", dropna=False).size().reset_index(name="count")
         if not by_bias.empty:
-            st.plotly_chart(px.bar(by_bias, x="bias", y="count", title="Distribuția bias-ului (Bullish / Bearish / Mixed)"), use_container_width=True)
+            st.plotly_chart(px.bar(by_bias, x="bias", y="count", title="Distribuția bias-ului"), use_container_width=True)
     if "_score" in tmp.columns:
         by_day = tmp.groupby("date")["_score"].mean().reset_index()
         if not by_day.empty:
@@ -460,40 +485,32 @@ if not news_df.empty:
             tmp["_source_name"] = ""
     top_src = tmp.groupby("_source_name", dropna=False).size().sort_values(ascending=False).head(12).reset_index(name="count").rename(columns={"_source_name":"source"})
     if not top_src.empty:
-        st.plotly_chart(px.bar(top_src, x="source", y="count", title="Top surse (număr articole)"), use_container_width=True)
+        st.plotly_chart(px.bar(top_src, x="source", y="count", title="Top surse"), use_container_width=True)
 
-# =========================
-#   CALENDAR SECTION (UI)
-# =========================
+# ======================================
+#   CALENDAR – UI (Azi / 3 zile / 7 zile)
+# ======================================
 st.subheader("🗓️ Calendar inteligent (US)")
 dleft, dright = st.columns([1,2])
 with dleft:
     cal_days_label = st.selectbox("Interval calendar", ["Azi", "3 zile", "7 zile"], index=1)
     span = {"Azi":1, "3 zile":3, "7 zile":7}[cal_days_label]
 with dright:
-    st.caption("Încerc providerul selectat (TE/FMP). Dacă nu are date, fallback automat la ForexFactory (public XML). Săgeata ⬆️/⬇️/≈ = impact direcțional estimat (euristic).")
+    st.caption("TE/FMP cu chunking pe 3 zile; dacă nu răspund, fallback la ForexFactory (multi-host). Săgeata ⬆️/⬇️/≈ = impact estimat (euristic).")
 
 cal_df2, diag2 = load_calendar_with_diagnostics(span, cal_provider, TE_KEY, FMP_KEY)
-
 if cal_df2 is None or cal_df2.empty:
-    st.info("Nu am date de calendar pentru intervalul ales (toți providerii au răspuns gol sau blocați).")
+    st.info("Nu am date de calendar pentru intervalul ales (toți furnizorii goi sau blocați).")
 else:
-    # SAFE SELECTOR: garantează coloane și selectează doar ce există
-    required_cols = ["datetime","imp_lbl","event","actual","forecast","previous","arrow","category"]
-    for col in required_cols:
-        if col not in cal_df2.columns:
-            cal_df2[col] = ""
-    show_cols = [c for c in required_cols if c in cal_df2.columns]
-    show = cal_df2[show_cols].copy()
-    show = show.rename(columns={
-        "datetime":"Ora (UTC)","imp_lbl":"Impact","event":"Eveniment",
-        "actual":"Actual","forecast":"Forecast","previous":"Previous","arrow":"US30 Impact","category":"Categorie"
-    })
+    need = ["datetime","imp_lbl","event","actual","forecast","previous","arrow","category"]
+    for c in need:
+        if c not in cal_df2.columns: cal_df2[c] = ""
+    show = cal_df2[need].rename(columns={"datetime":"Ora (UTC)","imp_lbl":"Impact","event":"Eveniment","actual":"Actual","forecast":"Forecast","previous":"Previous","arrow":"US30 Impact","category":"Categorie"})
     st.dataframe(show, use_container_width=True, height=360)
 
-# =========================
+# ======================================
 #   NEWS TABLE + EXPORT
-# =========================
+# ======================================
 st.subheader("📰 Știri filtrate")
 if not news_df.empty:
     show_news = news_df.sort_values("publishedAt", ascending=False)[["publishedAt","_source_name","title","_score","_cats","url","bias"]].rename(columns={"_source_name":"source","_score":"score","_cats":"cats"})
@@ -501,3 +518,123 @@ if not news_df.empty:
     st.download_button("⬇️ Descarcă CSV filtrat", data=show_news.to_csv(index=False), file_name="us30_news_filtered.csv", mime="text/csv")
 else:
     st.write("—")
+
+# ======================================
+#   💵 MONEY IN POLITICS (OpenSecrets + FTM)
+# ======================================
+st.markdown("## 💵 Money in Politics (OpenSecrets + FollowTheMoney)")
+
+with st.sidebar:
+    st.subheader("💾 OpenSecrets CSV")
+    st.caption("Încarcă CSV/TSV exportat din OpenSecrets (lobbying/contributions).")
+    os_file = st.file_uploader("Fișier OpenSecrets (.csv/.tsv)", type=["csv","tsv"])
+    live_ftm = st.checkbox("Activează fallback Live (FollowTheMoney, gratuit)", value=False)
+
+# map nume -> ticker Dow
+NAME_TO_TICK = {v:k for k,v in DOW_COMPONENTS.items()}
+
+def _read_os_csv(f):
+    import io
+    raw = f.read()
+    sep = "\t" if f.name.lower().endswith(".tsv") else ","
+    df = pd.read_csv(io.BytesIO(raw), sep=sep)
+    df.columns = [c.strip().lower() for c in df.columns]
+    return df
+
+def _guess_amount_col(cols):
+    keys = ["amount","total","sum","expenditure","expenditures","receipts","contributions","$","spent","spending"]
+    for c in cols:
+        for k in keys:
+            if k in c: return c
+    return None
+
+def _guess_name_cols(cols):
+    cand = []
+    for c in cols:
+        if any(k in c for k in ["client","organization","org","recipient","committee","employer","filer","registrant","lobbyist"]):
+            cand.append(c)
+    return cand or []
+
+def _clean_names(series):
+    return series.astype(str).str.replace(r"\b(Inc\.?|Corporation|Corp\.?|LLC|Ltd\.?|Co\.?)\b","", regex=True).str.replace(r"\s+"," ", regex=True).str.strip()
+
+def _attach_dow(df, name_cols):
+    ent = None
+    for c in name_cols:
+        col = _clean_names(df[c].fillna(""))
+        ent = col if ent is None else (ent + " " + col)
+    df["entity"] = (ent if ent is not None else "").astype(str).str.strip()
+    df["dow_match"] = None
+    for full_name, tick in NAME_TO_TICK.items():
+        mask = df["entity"].str.contains(full_name, case=False, na=False) | df["entity"].str.contains(tick, case=False, na=False)
+        df.loc[mask, "dow_match"] = tick
+    return df
+
+def _policy_pulse(group_df, amount_col):
+    df = group_df.copy()
+    # detect time column
+    tcol = None
+    for c in ["year","yr","fyear","cycle","quarter","period","date"]:
+        if c in df.columns: tcol = c; break
+    if tcol is None:
+        return 0.0
+    try:
+        df["_t"] = pd.to_datetime(df[tcol], errors="coerce", utc=True)
+    except Exception:
+        df["_t"] = pd.to_datetime(df[tcol].astype(str) + "-01-01", errors="coerce", utc=True)
+    df = df.dropna(subset=["_t"])
+    cutoff_1y = pd.Timestamp.utcnow() - pd.Timedelta(days=365)
+    last = pd.to_numeric(df.loc[df["_t"] >= cutoff_1y, amount_col], errors="coerce").sum()
+    hist = pd.to_numeric(df.loc[(df["_t"] < cutoff_1y) & (df["_t"] >= pd.Timestamp.utcnow() - pd.Timedelta(days=3*365)), amount_col], errors="coerce").sum()
+    avg_hist = hist/3.0 if hist>0 else 0
+    if last==0 and avg_hist==0: return 0.0
+    ratio = (last/(avg_hist+1e-6)) if avg_hist>0 else (1.0 if last>0 else 0.0)
+    ratio = min(2.0, max(0.0, ratio))
+    return round((ratio-1.0), 2)
+
+if os_file is not None:
+    try:
+        os_df = _read_os_csv(os_file)
+        amt_col = _guess_amount_col(os_df.columns)
+        name_cols = _guess_name_cols(os_df.columns)
+        if amt_col is None or not name_cols:
+            st.warning("Nu găsesc coloanele de sume sau nume entitate în CSV. Încarcă un export cu câmpuri standard (client/organization + amount).")
+        else:
+            os_df[amt_col] = pd.to_numeric(os_df[amt_col], errors="coerce")
+            os_df = _attach_dow(os_df, name_cols)
+
+            dow_rows = os_df.dropna(subset=["dow_match"])
+            if dow_rows.empty:
+                st.info("Nu am găsit potriviri clare cu companii din Dow în acest fișier.")
+            else:
+                grp = dow_rows.groupby("dow_match")[amt_col].sum().reset_index().sort_values(amt_col, ascending=False)
+                st.plotly_chart(px.bar(grp, x="dow_match", y=amt_col, title="Top cheltuieli (CSV OpenSecrets) pe componente Dow"), use_container_width=True)
+
+                pulses = [{"ticker": t, "policy_pulse": _policy_pulse(g, amt_col)} for t, g in dow_rows.groupby("dow_match")]
+                pulse_df = pd.DataFrame(pulses).sort_values("policy_pulse", ascending=False)
+                st.plotly_chart(px.bar(pulse_df, x="ticker", y="policy_pulse", title="Policy Pulse (−1..+1) – momentum 12m vs medie 3y"), use_container_width=True)
+
+                cat_col = None
+                for c in ["issue","category","sector","industry","lobbying_issues","general_issue"]:
+                    if c in os_df.columns: cat_col = c; break
+                if cat_col:
+                    topcat = dow_rows.groupby(["dow_match", cat_col])[amt_col].sum().reset_index()
+                    st.plotly_chart(px.density_heatmap(topcat, x="dow_match", y=cat_col, z=amt_col, title="Heatmap teme/policy vs companii Dow"), use_container_width=True)
+
+                us30_policy = pulse_df["policy_pulse"].mean() if not pulse_df.empty else 0.0
+                st.metric("US30 Policy Pulse (CSV)", f"{us30_policy:+.2f}")
+    except Exception as e:
+        st.error(f"Eroare la citirea CSV: {e}")
+
+# Fallback „live” demo: FollowTheMoney (status simplu; recomand cheie gratuită pentru interogări reale)
+def _ftm_quick_demo():
+    try:
+        r = requests.get("https://www.followthemoney.org/api/1.0/entities", timeout=15)
+        return r.status_code
+    except Exception as e:
+        return str(e)
+
+with st.expander("🔧 FollowTheMoney (demo)"):
+    st.caption("Pentru rezultate utile, creează un cont gratuit la FollowTheMoney și adaugă cheia în Secrets. Aici doar verificăm accesul de bază.")
+    if st.checkbox("Rulează test acces FTM"):
+        st.write("FTM status:", _ftm_quick_demo())
