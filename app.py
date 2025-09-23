@@ -638,3 +638,4 @@ with st.expander("🔧 FollowTheMoney (demo)"):
     st.caption("Pentru rezultate utile, creează un cont gratuit la FollowTheMoney și adaugă cheia în Secrets. Aici doar verificăm accesul de bază.")
     if st.checkbox("Rulează test acces FTM"):
         st.write("FTM status:", _ftm_quick_demo())
+
